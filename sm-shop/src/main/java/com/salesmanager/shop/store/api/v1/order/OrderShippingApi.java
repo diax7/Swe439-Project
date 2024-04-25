@@ -41,250 +41,148 @@ import com.salesmanager.shop.utils.LabelUtils;
 import io.swagger.annotations.Api;
 import io.swagger.annotations.ApiImplicitParam;
 import io.swagger.annotations.ApiImplicitParams;
-import io.swagger.annotations.SwaggerDefinition;
-import io.swagger.annotations.Tag;
 import springfox.documentation.annotations.ApiIgnore;
 
 @Controller
 @RequestMapping("/api/v1")
 @Api(tags = {"Shipping Quotes and Calculation resource (Shipping Api)"})
-@SwaggerDefinition(tags = {
-    @Tag(name = "Shipping Quotes and Calculation resource", description = "Get shipping quotes for public api and loged in customers")
-})
 public class OrderShippingApi {
 
   private static final Logger LOGGER = LoggerFactory.getLogger(OrderShippingApi.class);
 
   @Inject private CustomerService customerService;
-
   @Inject private OrderFacade orderFacade;
-
   @Inject private ShoppingCartFacade shoppingCartFacade;
-
   @Inject private LabelUtils messages;
-
   @Inject private PricingService pricingService;
-  
   @Inject private CountryService countryService;
 
-  /**
-   * Get shipping quote for a given shopping cart
-   *
-   * @param id
-   * @param request
-   * @param response
-   * @return
-   * @throws Exception
-   */
-  @RequestMapping(
-      value = {"/auth/cart/{code}/shipping"},
-      method = RequestMethod.GET)
+  @RequestMapping(value = "/auth/cart/{code}/shipping", method = RequestMethod.GET)
   @ResponseBody
-  @ApiImplicitParams({
-      @ApiImplicitParam(name = "store", dataType = "String", defaultValue = "DEFAULT"),
-      @ApiImplicitParam(name = "lang", dataType = "String", defaultValue = "en")
-  })
   public ReadableShippingSummary shipping(
       @PathVariable final String code,
       @ApiIgnore MerchantStore merchantStore,
       @ApiIgnore Language language,
       HttpServletRequest request,
       HttpServletResponse response) {
-
     try {
-      Locale locale = request.getLocale();
-      Principal principal = request.getUserPrincipal();
-      String userName = principal.getName();
+      ShoppingCart cart = validateAndGetCart(code, merchantStore, request, response);
+      if (cart == null) return null;
 
-      // get customer id
-      Customer customer = customerService.getByNick(userName);
+      Customer customer = validateAndGetCustomer(request, response);
+      if (customer == null || !validateCustomerCart(cart, customer, response)) return null;
 
-      if (customer == null) {
-        response.sendError(503, "Error while getting user details to calculate shipping quote");
-      }
-
-      ShoppingCart cart = shoppingCartFacade.getShoppingCartModel(code, merchantStore);
-
-      if (cart == null) {
-        response.sendError(404, "Cart code " + code + " does not exist");
-      }
-
-      if (cart.getCustomerId() == null) {
-        response.sendError(404, "Cart code " + code + " does not exist for exist for user " + userName);
-      }
-
-      if (cart.getCustomerId().longValue() != customer.getId().longValue()) {
-        response.sendError(404, "Cart code " + code + " does not exist for exist for user " + userName);
-      }
-
-      ShippingQuote quote = orderFacade.getShippingQuote(customer, cart, merchantStore, language);
-
-      ShippingSummary summary = orderFacade.getShippingSummary(quote, merchantStore, language);
-
-      ReadableShippingSummary shippingSummary = new ReadableShippingSummary();
-      ReadableShippingSummaryPopulator populator = new ReadableShippingSummaryPopulator();
-      populator.setPricingService(pricingService);
-      populator.populate(summary, shippingSummary, merchantStore, language);
-
-      List<ShippingOption> options = quote.getShippingOptions();
-
-      if (!CollectionUtils.isEmpty(options)) {
-
-        for (ShippingOption shipOption : options) {
-
-          StringBuilder moduleName = new StringBuilder();
-          moduleName.append("module.shipping.").append(shipOption.getShippingModuleCode());
-
-          String carrier =
-              messages.getMessage(
-                  moduleName.toString(), new String[] {merchantStore.getStorename()}, locale);
-
-          String note = messages.getMessage(moduleName.append(".note").toString(), locale, "");
-
-          shipOption.setDescription(carrier);
-          shipOption.setNote(note);
-
-          // option name
-          if (!StringUtils.isBlank(shipOption.getOptionCode())) {
-            // try to get the translate
-            StringBuilder optionCodeBuilder = new StringBuilder();
-            try {
-
-              optionCodeBuilder
-                  .append("module.shipping.")
-                  .append(shipOption.getShippingModuleCode());
-              String optionName = messages.getMessage(optionCodeBuilder.toString(), locale);
-              shipOption.setOptionName(optionName);
-            } catch (Exception e) { // label not found
-              LOGGER.warn("No shipping code found for " + optionCodeBuilder.toString());
-            }
-          }
-        }
-
-        shippingSummary.setShippingOptions(options);
-      }
-
-      return shippingSummary;
-
+      return calculateShippingSummary(customer, cart, merchantStore, language, request.getLocale());
     } catch (Exception e) {
       LOGGER.error("Error while getting shipping quote", e);
-      try {
-        response.sendError(503, "Error while getting shipping quote" + e.getMessage());
-      } catch (Exception ignore) {
-      }
+      sendError(response, 503, "Error while getting shipping quote" + e.getMessage());
       return null;
     }
   }
 
-  /**
-   * Get shipping quote based on postal code
-   * @param code
-   * @param address
-   * @param merchantStore
-   * @param language
-   * @param request
-   * @param response
-   * @return
-   * @throws Exception
-   */
-  @RequestMapping(
-      value = {"/cart/{code}/shipping"},
-      method = RequestMethod.POST)
+  @RequestMapping(value = "/cart/{code}/shipping", method = RequestMethod.POST)
   @ResponseBody
-  @ApiImplicitParams({
-      @ApiImplicitParam(name = "store", dataType = "String", defaultValue = "DEFAULT"),
-      @ApiImplicitParam(name = "lang", dataType = "String", defaultValue = "en")
-  })
   public ReadableShippingSummary shipping(
       @PathVariable final String code,
       @RequestBody AddressLocation address,
       @ApiIgnore MerchantStore merchantStore,
       @ApiIgnore Language language,
       HttpServletRequest request,
-      HttpServletResponse response)
-      throws Exception {
-
+      HttpServletResponse response) throws Exception {
     try {
-      Locale locale = request.getLocale();
+      ShoppingCart cart = validateAndGetCart(code, merchantStore, request, response);
+      if (cart == null) return null;
 
-      ShoppingCart cart = shoppingCartFacade.getShoppingCartModel(code, merchantStore);
-
-      if (cart == null) {
-        response.sendError(404, "Cart id " + code + " does not exist");
-      }
-
-      
-      Delivery addr = new Delivery();
-      addr.setPostalCode(address.getPostalCode());
-
-      Country c = countryService.getByCode(address.getCountryCode());
-      
-      if(c==null) {
-    	c = merchantStore.getCountry();
-      }
-      addr.setCountry(c);
-
-      
-      Customer temp = new Customer();
-      temp.setAnonymous(true);
-      temp.setDelivery(addr);
-      
-      ShippingQuote quote = orderFacade.getShippingQuote(temp, cart, merchantStore, language);
-
-      ShippingSummary summary = orderFacade.getShippingSummary(quote, merchantStore, language);
-
-      ReadableShippingSummary shippingSummary = new ReadableShippingSummary();
-      ReadableShippingSummaryPopulator populator = new ReadableShippingSummaryPopulator();
-      populator.setPricingService(pricingService);
-      populator.populate(summary, shippingSummary, merchantStore, language);
-
-      List<ShippingOption> options = quote.getShippingOptions();
-
-      if (!CollectionUtils.isEmpty(options)) {
-
-        for (ShippingOption shipOption : options) {
-
-          StringBuilder moduleName = new StringBuilder();
-          moduleName.append("module.shipping.").append(shipOption.getShippingModuleCode());
-
-          String carrier =
-              messages.getMessage(
-                  moduleName.toString(), new String[] {merchantStore.getStorename()}, locale);
-
-          String note = messages.getMessage(moduleName.append(".note").toString(), locale, "");
-
-          shipOption.setDescription(carrier);
-          shipOption.setNote(note);
-
-          // option name
-          if (!StringUtils.isBlank(shipOption.getOptionCode())) {
-            // try to get the translate
-            StringBuilder optionCodeBuilder = new StringBuilder();
-            try {
-
-              optionCodeBuilder
-                  .append("module.shipping.")
-                  .append(shipOption.getShippingModuleCode());
-              String optionName = messages.getMessage(optionCodeBuilder.toString(), new String[]{merchantStore.getStorename()},locale);
-              shipOption.setOptionName(optionName);
-            } catch (Exception e) { // label not found
-              LOGGER.warn("No shipping code found for " + optionCodeBuilder.toString());
-            }
-          }
-        }
-
-        shippingSummary.setShippingOptions(options);
-      }
-
-      return shippingSummary;
-
+      Customer temp = createTemporaryCustomer(address, merchantStore);
+      return calculateShippingSummary(temp, cart, merchantStore, language, request.getLocale());
     } catch (Exception e) {
       LOGGER.error("Error while getting shipping quote", e);
-      try {
-        response.sendError(503, "Error while getting shipping quote" + e.getMessage());
-      } catch (Exception ignore) {
-      }
+      sendError(response, 503, "Error while getting shipping quote" + e.getMessage());
       return null;
     }
+  }
+
+  private ShoppingCart validateAndGetCart(String code, MerchantStore merchantStore, HttpServletRequest request, HttpServletResponse response) {
+    ShoppingCart cart = shoppingCartFacade.getShoppingCartModel(code, merchantStore);
+    if (cart == null) {
+      sendError(response, 404, "Cart code " + code + " does not exist");
+    }
+    return cart;
+  }
+
+  private Customer validateAndGetCustomer(HttpServletRequest request, HttpServletResponse response) {
+    Principal principal = request.getUserPrincipal();
+    String userName = principal != null ? principal.getName() : null;
+    if (userName == null) {
+      sendError(response, 503, "User not logged in");
+      return null;
+    }
+    Customer customer = customerService.getByNick(userName);
+    if (customer == null) {
+      sendError(response, 503, "Error while getting user details to calculate shipping quote");
+    }
+    return customer;
+  }
+
+  private boolean validateCustomerCart(ShoppingCart cart, Customer customer, HttpServletResponse response) {
+    if (cart.getCustomerId() == null || cart.getCustomerId().longValue() != customer.getId().longValue()) {
+      sendError(response, 404, "Cart does not exist for user " + customer.getNick());
+      return false;
+    }
+    return true;
+  }
+
+  private Customer createTemporaryCustomer(AddressLocation address, MerchantStore merchantStore) {
+    Delivery addr = new Delivery();
+    addr.setPostalCode(address.getPostalCode());
+    Country c = countryService.getByCode(address.getCountryCode());
+    addr.setCountry(c != null ? c : merchantStore.getCountry());
+    Customer temp = new Customer();
+    temp.setAnonymous(true);
+    temp.setDelivery(addr);
+    return temp;
+  }
+
+  private ReadableShippingSummary calculateShippingSummary(Customer customer, ShoppingCart cart, MerchantStore merchantStore, Language language, Locale locale) {
+    ShippingQuote quote = orderFacade.getShippingQuote(customer, cart, merchantStore, language);
+    ShippingSummary summary = orderFacade.getShippingSummary(quote, merchantStore, language);
+    ReadableShippingSummary shippingSummary = new ReadableShippingSummary();
+    ReadableShippingSummaryPopulator populator = new ReadableShippingSummaryPopulator();
+    populator.setPricingService(pricingService);
+    populator.populate(summary, shippingSummary, merchantStore, language);
+    populateShippingOptions(quote, shippingSummary, merchantStore, locale);
+    return shippingSummary;
+  }
+
+  private void populateShippingOptions(ShippingQuote quote, ReadableShippingSummary shippingSummary, MerchantStore merchantStore, Locale locale) {
+    List<ShippingOption> options = quote.getShippingOptions();
+    if (!CollectionUtils.isEmpty(options)) {
+      for (ShippingOption shipOption : options) {
+        StringBuilder moduleName = new StringBuilder("module.shipping.").append(shipOption.getShippingModuleCode());
+        String carrier = messages.getMessage(moduleName.toString(), new String[] {merchantStore.getStorename()}, locale);
+        shipOption.setDescription(carrier);
+        String note = messages.getMessage(moduleName.append(".note").toString(), locale, "");
+        shipOption.setNote(note);
+        setOptionName(shipOption, moduleName, locale);
+      }
+      shippingSummary.setShippingOptions(options);
+    }
+  }
+
+  private void setOptionName(ShippingOption shipOption, StringBuilder moduleName, Locale locale) {
+    if (!StringUtils.isBlank(shipOption.getOptionCode())) {
+      try {
+        String optionName = messages.getMessage(moduleName.toString(), locale);
+        shipOption.setOptionName(optionName);
+      } catch (Exception e) { // label not found
+        LOGGER.warn("No shipping code found for " + moduleName.toString());
+      }
+    }
+  }
+
+  private void sendError(HttpServletResponse response, int errorCode, String errorMessage) {
+    try {
+      response.sendError(errorCode, errorMessage);
+    } catch (Exception ignore) {}
   }
 }
